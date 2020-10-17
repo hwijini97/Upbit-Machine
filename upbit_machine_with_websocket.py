@@ -45,6 +45,7 @@ class UpbitMachine:
         self.access_key = config["UPBIT"]["access_key"]
         self.secret_key = config["UPBIT"]["secret_key"]
         self.profit = float(config["MACHINE"]["profit"])
+        self.how_many_coins = int(config["MACHINE"]["how_many_coins"])
         self.maximum_by_bitcoin = float(config["MACHINE"]["maximum_by_bitcoin"])
         self.minimum_by_bitcoin = float(config["MACHINE"]["minimum_by_bitcoin"])
         self.trade_if_rising = int(config["MACHINE"]["trade_if_rising"])
@@ -72,41 +73,71 @@ class UpbitMachine:
         return res
 
     def get_trade_coin_list(self):
-        coin_list = []
+        coin_list_with_symbol = []
         for i in range(0, len(self.all_coin_list)):
             market_name = self.all_coin_list[i]["market"][0:3]
             coin_name = self.all_coin_list[i]["market"][4:]
             for j in range(0, len(self.all_coin_list)):
                 if market_name != self.all_coin_list[j]["market"][0:3] and coin_name == self.all_coin_list[j]["market"][4:]:  # 시장 이름은 다른데 코인 이름은 같은 게 존재하면
-                    coin_list.append(self.all_coin_list[i]["market"])
+                    coin_list_with_symbol.append(self.all_coin_list[i]["market"])
                     break
-        return coin_list
+
+        coin_list = []
+        for coin_with_symbol in coin_list_with_symbol:
+            if coin_with_symbol[4:] not in coin_list:
+                coin_list.append(coin_with_symbol[4:])
+
+        candle_list = []  # candle_list[i] = coin_list[i]의 캔들 정보
+
+        """ 거래 가능한 코인들의 캔들 정보를 불러옴 """
+        for coin_name in coin_list:
+            candle = self.get_candle("KRW", coin_name, 60)
+            candle_list.append(float(candle["candle_acc_trade_price"]))
+            time.sleep(0.05)
+
+        """ 내림차순 정렬 """
+        for i in range(0, len(coin_list)):
+            for j in range(i + 1, len(coin_list)):
+                if candle_list[i] < candle_list[j]:
+                    temp_coin = coin_list[i]
+                    temp_acc_price = candle_list[i]
+                    coin_list[i] = coin_list[j]
+                    candle_list[i] = candle_list[j]
+                    coin_list[j] = temp_coin
+                    candle_list[j] = temp_acc_price
+
+        """ 거래량이 많은 코인부터 how_many_coins개의 코인을 반환"""
+        print("거래할 코인 목록 : " + str(coin_list[0:self.how_many_coins]))
+        return coin_list[0:self.how_many_coins]
 
     def get_trade_coin_str(self):
         coin_str = ""
-        for coin in self.trade_coin_list:
-            coin_str = coin_str + "," + "\"" + coin + ".2\""
+        for coin_name in self.trade_coin_list:
+            coin_str = coin_str + "," + "\"" + "CRIX.UPBIT.KRW-" + coin_name + ".1\""
+        for coin_name in self.trade_coin_list:
+            coin_str = coin_str + "," + "\"" + "CRIX.UPBIT.BTC-" + coin_name + ".1\""
         return coin_str[1:]
 
     """ 웹 소켓 사용해서 실시간 orderbook 정보를 불러옴 """
     async def get_orderbook_with_websocket(self):
-        uri = "wss://api.upbit.com/websocket/v1"
+        uri = "wss://crix-ws.upbit.com/websocket"
 
         async with websockets.connect(uri, ping_interval=None) as websocket:
             # 구독 요청
-            data = "[{'ticket':'test'},{'format':'SIMPLE'},{'type':'orderbook','codes':[\'KRW-BTC.2\',' + self.trade_coin_str + ']}]"
+            data = "[{\"ticket\":\"auto_trading\"},{\"format\":\"SIMPLE\"},{\"type\":\"crixOrderbook\",\"codes\":[\"CRIX.UPBIT.KRW-BTC.1\"," + self.trade_coin_str + "]}]"
+
             await websocket.send(data)
 
             while True:
                 recv_data = await websocket.recv()
                 orderbook = json.loads(recv_data)
-                self.orderbook_dictionary[orderbook["cd"]] = orderbook["obu"]
+                self.orderbook_dictionary[orderbook["cd"][11:]] = orderbook["obu"]
                 if orderbook["st"] == "SNAPSHOT":
-                    self.previous_orderbook_dictionary[orderbook["cd"]] = orderbook["obu"]
-                    self.orderbook_dictionary[orderbook["cd"]] = orderbook["obu"]
+                    self.previous_orderbook_dictionary[orderbook["cd"][11:]] = orderbook["obu"]
+                    self.orderbook_dictionary[orderbook["cd"][11:]] = orderbook["obu"]
                 else:
-                    self.previous_orderbook_dictionary[orderbook["cd"]] = self.orderbook_dictionary[orderbook["cd"]]
-                    self.orderbook_dictionary[orderbook["cd"]] = orderbook["obu"]
+                    self.previous_orderbook_dictionary[orderbook["cd"][11:]] = self.orderbook_dictionary[orderbook["cd"][11:]]
+                    self.orderbook_dictionary[orderbook["cd"][11:]] = orderbook["obu"]
 
     @staticmethod
     def get_time_str():
@@ -287,11 +318,29 @@ class UpbitMachine:
         res = self.api_query(authorization=True, path="orders", method="post", query_params=query_params)
 
         if res is None:  # insufficient_funds_bid 오류
+            print(query_params)
             self.cancel_all_order()
             res = self.api_query(authorization=True, path="orders", method="post", query_params=query_params)
             if res is None:  # 주문 모두 취소했는데도 오류가 생기면 진짜 돈이 부족하다고 판단하고 오류 처리
                 return None
         return res["uuid"]
+
+    def get_candle(self, trade_market=None, coin=None, unit=-1):
+        if trade_market is None or coin is None or unit < 0:
+            raise Exception("Need to set params")
+        if unit != 1 and unit != 3 and unit != 5 and unit != 10 and unit != 15 and unit != 30 and unit != 60 and unit != 240:
+            raise Exception("올바른 분 단위를 입력해주세요")
+        currency_type = trade_market + "-" + coin
+        query_params = urlencode({"market": currency_type})
+        try:
+            res = self.api_query(authorization=False, path='candles/minutes/' + str(unit), method='get', query_params=query_params)
+            if "candle_acc_trade_price" in res[0]:
+                return res[0]
+        except requests.exceptions.ConnectionError:
+            return -1
+        except TypeError:
+            return -1
+        return -1
 
     """ uuid에 해당하는 주문을 취소하고 그 주문에 대한 내역을 반환 """
     def cancel_order(self, uuid, count=2):
@@ -397,8 +446,7 @@ class UpbitMachine:
     def calculate_profit(self):
         while True:
             time.sleep(0.05)
-            for coin_symbol in self.trade_coin_list:
-                coin_name = coin_symbol[4:]
+            for coin_name in self.trade_coin_list:
                 """ KRW <-> BTC """
                 profit_btc_krw = 0
                 profit_krw_btc = 0
@@ -436,28 +484,41 @@ class UpbitMachine:
                             # print(self.market[max_profit_cycle_num][0] + "시장에서 " + self.ALL_COIN[i] + "코인의 매수 매도 호가의 차이가 많이 나므로 거래를 하지 않습니다. 매도 호가 : " + str(self.coin_price[len(self.coin_price)-1][self.market[max_profit_cycle_num][0]][0][i]["ask_price"]) + ", 매수 호가 : " + str(self.coin_price[len(self.coin_price)-1][self.market[max_profit_cycle_num][0]][0][i]["bid_price"]))
                             return
 
+                    """
                     time.sleep(0.05)  # 해당 코인에 대해 많은 양의 거래가 한 순간에 이루어졌는데 그 중간 가격을 가지고 수익률을 계산한 경우를 방지
                     if self.profit > self.calculate_profit_of_cycle(coin_name, max_profit_cycle_num):
                         print("코인 이름: " + coin_name + ", 사이클 번호 : " + str(max_profit_cycle_num) + "번, 갑작스러운 시세변동으로 인해 거래를 하지 않습니다.")
                     else:
+                    """
+                    if True:
                         optimal_volume = self.get_optimal_volume(coin_name=coin_name, cycle_num=max_profit_cycle_num)  # 비트 기준
                         order_volume = self.get_order_volume(optimal_volume=optimal_volume)  # 비트 기준
                         if order_volume != -1 and self.trading is False:
                             self.trading = True
                             print("----------------------------------------------------------------------------------------------------------------------------------------")
                             print("현재시각 : " + str(datetime.now()) + ", " + coin_name + " 코인의 최적 거래 사이클 번호 : " + str(max_profit_cycle_num) + "번, 예상 수익률 : " + str(round(max_profit, 4)) + ", 최적 거래 개수 : " + str(round(optimal_volume, 8)))
-                            print(self.orderbook_dictionary["KRW-" + coin_name][0])
-                            print(self.orderbook_dictionary["BTC-" + coin_name][0])
+                            print(str(datetime.now()) + ", " + str(self.orderbook_dictionary["KRW-" + coin_name][0]) + ", " + str(self.orderbook_dictionary["BTC-" + coin_name][0]))
 
                             x_coin_volume = self.get_x_coin_volume(coin_name=coin_name, cycle_num=max_profit_cycle_num, order_volume=order_volume)
 
                             try:
-                                self.trade_cycle(coin_name, max_profit_cycle_num, x_coin_volume)  # 지정가 거래, 느리더라도 안전하게 거래
+                                t1 = datetime.now()
+                                Thread(target=self.trade_cycle, args=(coin_name, max_profit_cycle_num, x_coin_volume)).start()  # 지정가 거래, 느리더라도 안전하게 거래
+                                print(str(datetime.now()) + ", " + str(datetime.now()) + ", " + coin_name + " 코인의 profit : " + str(max_profit))
+                                while max_profit > self.profit:
+                                    time.sleep(0.1)
+                                    max_profit = self.calculate_profit_of_cycle(coin_name, max_profit_cycle_num)
+                                    print(str(datetime.now()) + ", " + str(self.orderbook_dictionary["KRW-" + coin_name][0]) + ", " + str(self.orderbook_dictionary["BTC-" + coin_name][0]))
+                                t2 = datetime.now()
+                                print(str(datetime.now()) + ", " + coin_name + " 코인의 profit : " + str(max_profit))
+                                print("거래 가능한 시간 : " + str(t2-t1))
                                 # self.trade_cycle2(coin_name, max_profit_cycle_num, x_coin_volume)  # 시장가 거래, 크게 손해 볼 확률이 있지만 무시하고 아주 빠르게 거래 진행
                             except Exception as ex:
                                 print("오류가 발생하여 거래가 중지되었습니다.")
                                 print(repr(ex))
                                 traceback.print_exc()
+                            while self.trading is True:
+                                time.sleep(0.1)
                             time.sleep(0.5)
 
                             """ 초기 지갑 내역 불러오기 """
@@ -487,6 +548,7 @@ class UpbitMachine:
         while executed_volume == 0:
             temp_wallet = self.get_my_wallet()
             executed_volume = self.get_my_balance(temp_wallet, coin_name)
+        print(str(datetime.now()) + ", 첫 번째 거래 완료")
 
         """@@@@@@@@@@@@@@@@@@ 두 번째 거래 시작 @@@@@@@@@@@@@@@@@@"""
         self.place_order(self.market[cycle_num][1], coin_name, self.order_type[cycle_num][1], volume=executed_volume, price=None, ord_type="market")  # 시장가 매도
@@ -496,6 +558,7 @@ class UpbitMachine:
         while volume1 == volume2:
             temp_wallet = self.get_my_wallet()
             volume2 = self.get_my_balance(temp_wallet, "BTC")  # 두 번째 거래 이후에 보유한 BTC 수량
+        print(str(datetime.now()) + ", 두 번째 거래 완료")
 
         """@@@@@@@@@@@@@@@@@@ 세 번째 거래 시작 @@@@@@@@@@@@@@@@@@"""
         volume = abs(volume2 - volume1)  # 거래 전후 BTC 수량 차이
@@ -504,6 +567,8 @@ class UpbitMachine:
         elif cycle_num == 2:
             self.place_order("KRW", "BTC", "ask", volume=volume, price=None, ord_type="market")  # 시장가 매도
         time.sleep(1)
+        self.trading = False
+        print(str(datetime.now()) + ", 세 번째 거래 완료")
 
     """ 일반 거래 """
     def trade_cycle(self, coin_name=None, cycle_num=0, volume=0):
@@ -513,26 +578,29 @@ class UpbitMachine:
         order_id = self.place_order(trade_market=self.market[cycle_num][0], coin_name=coin_name, side=self.order_type[cycle_num][0], volume=volume, price=coin_bid_price)
         original_price = coin_bid_price
         if order_id is None:
-            print("오류가 발생하여 거래를 종료합니다.")
+            print(str(datetime.now()) + ", 오류가 발생하여 거래를 종료합니다.")
+            self.trading = False
             return -1
-        print(self.market[cycle_num][0] + " 시장에서 " + coin_name + " 코인을 " + str(coin_bid_price) + " " + self.market[cycle_num][0] + "에 " + str(volume) + "개 매수주문 함")
+        print(str(datetime.now()) + ", " + self.market[cycle_num][0] + " 시장에서 " + coin_name + " 코인을 " + str(coin_bid_price) + " " + self.market[cycle_num][0] + "에 " + str(volume) + "개 매수주문 함")
         # 주문내역을 불러옴
-        order = self.cancel_order(uuid=order_id)
+        order = self.cancel_order(uuid=order_id, count=5)
         executed_volume = float(order["executed_volume"])  # 체결된 수량
         if executed_volume == 0.0:  # 체결이 전혀 안 되었으면
-            print("체결이 전혀 안 되었으므로 주문을 취소합니다.")
+            print(str(datetime.now()) + ", 체결이 전혀 안 되었으므로 주문을 취소합니다.")
+            self.trading = False
             return -1
         # 조금이라도 체결 되었으면
-        print(str(executed_volume) + "만큼 주문이 체결되었습니다.")
+        print(str(datetime.now()) + ", " + str(executed_volume) + "만큼 주문이 체결되었습니다.")
 
         """@@@@@@@@@@@@@@@@@@ 두 번째 거래 시작 @@@@@@@@@@@@@@@@@@"""
         temp_wallet = self.get_my_wallet()
         volume = self.get_my_balance(temp_wallet, coin_name)
         order_id = self.place_order(trade_market=self.market[cycle_num][1], coin_name=coin_name, side=self.order_type[cycle_num][1], volume=volume, price=coin_ask_price)
         if order_id is None:
-            print("오류가 발생하여 거래를 종료합니다.")
+            print(str(datetime.now()) + ", 오류가 발생하여 거래를 종료합니다.")
+            self.trading = False
             return -1
-        print(self.market[cycle_num][1] + " 시장에서 " + coin_name + "코인을 " + str(coin_ask_price) + " " + self.market[cycle_num][1] + "에 " + str(executed_volume) + "개 매도주문 함")
+        print(str(datetime.now()) + ", " + self.market[cycle_num][1] + " 시장에서 " + coin_name + "코인을 " + str(coin_ask_price) + " " + self.market[cycle_num][1] + "에 " + str(executed_volume) + "개 매도주문 함")
         # 주문내역을 불러옴
         self.get_order(order_id)
         order = self.cancel_order(order_id)
@@ -551,16 +619,18 @@ class UpbitMachine:
                         if executed_volume > 0:  # 사이클을 진행하여 체결된 양이 있으면 -> 오류가 떠도 세 번째 거래로 넘어감
                             break
                         else:  # 오류
-                            print("오류가 발생하여 거래를 종료합니다.")
+                            print(str(datetime.now()) + ", 오류가 발생하여 거래를 종료합니다.")
+                            self.trading = False
                             return -1
-                    print("주문이 완료되지 않았으므로 현재 호가인 " + str(resell_price) + " " + self.market[cycle_num][0] + "에 " + str(my_volume) + "개를 " + self.market[cycle_num][0] + "시장에 되팝니다.")
+                    print(str(datetime.now()) + ", 주문이 완료되지 않았으므로 현재 호가인 " + str(resell_price) + " " + self.market[cycle_num][0] + "에 " + str(my_volume) + "개를 " + self.market[cycle_num][0] + "시장에 되팝니다.")
                     order = self.get_order(uuid=order_id, count=10)
                     state = order["state"]  # 주문 상태
                     if state == "done":
                         if executed_volume > 0:
                             break
                         else:  # 사이클을 진행하지 않고 되팔기만 한 경우
-                            print("모든 주문이 체결되었습니다.")
+                            print(str(datetime.now()) + ", 모든 주문이 체결되었습니다.")
+                            self.trading = False
                             return 0
                 else:  # 모두 체결된 경우
                     break
@@ -568,7 +638,7 @@ class UpbitMachine:
                 if str(my_volume) != "0.0":
                     current_price = self.orderbook_dictionary[self.market[cycle_num][1]+"-"+coin_name][0][self.price_type[cycle_num][1]]
                     order_id = self.place_order(trade_market=self.market[cycle_num][1], coin_name=coin_name, side=self.order_type[cycle_num][1], volume=my_volume, price=current_price)
-                    print("주문이 완료되지 않았으므로 현재 호가인 " + str(current_price) + " " + self.market[cycle_num][1] + "에 " + str(my_volume) + "개를 다시 주문을 합니다. (체결된 수량 : " + str(executed_volume) + ")")
+                    print(str(datetime.now()) + ", 주문이 완료되지 않았으므로 현재 호가인 " + str(current_price) + " " + self.market[cycle_num][1] + "에 " + str(my_volume) + "개를 다시 주문을 합니다. (체결된 수량 : " + str(executed_volume) + ")")
                     if order_id is None:  # 극소량 주문해서 오류난 경우 -> 다 체결되었다 생각하고 넘어감
                         break
                     else:
@@ -580,7 +650,7 @@ class UpbitMachine:
         if executed_volume > 0.0:  # 조금이라도 체결 되었으면
             if order_id is not None:
                 self.cancel_order(uuid=order_id)  # 해당 주문 취소
-            print(str(executed_volume) + "만큼 주문이 체결되었습니다.")
+            print(str(datetime.now()) + ", " + str(executed_volume) + "만큼 주문이 체결되었습니다.")
 
             volume1 = self.get_my_balance(self.wallet, "BTC")  # 초기에 보유한 BTC 수량
 
@@ -594,17 +664,19 @@ class UpbitMachine:
                 price = self.orderbook_dictionary["KRW-BTC"][0][self.price_type[cycle_num][2]]
                 order_id = self.place_order(trade_market="KRW", coin_name="BTC", side=self.order_type[cycle_num][2], volume=volume, price=price)
                 if order_id is None:
-                    print("오류가 발생하여 거래를 종료합니다.")
+                    print(str(datetime.now()) + ", 오류가 발생하여 거래를 종료합니다.")
+                    self.trading = False
                     return -1
                 if self.order_type[cycle_num][2] == "ask":
                     order_type = "매도"
                 else:
                     order_type = "매수"
-                print("KRW 시장에서 BTC를 " + str(price) + " 원에 " + str(volume) + "개를 " + order_type + " 주문하였습니다.")
+                print(str(datetime.now()) + ", KRW 시장에서 BTC를 " + str(price) + " 원에 " + str(volume) + "개를 " + order_type + " 주문하였습니다.")
                 order = self.cancel_order(order_id)
                 executed_volume = float(order["executed_volume"])  # 체결된 수량
-                print(str(executed_volume) + "만큼 주문이 체결되었습니다.")
+                print(str(datetime.now()) + ", " + str(executed_volume) + "만큼 주문이 체결되었습니다.")
                 if order["remaining_volume"] == "0.0":
+                    self.trading = False
                     return 0
                 volume = order["remaining_volume"]
 
