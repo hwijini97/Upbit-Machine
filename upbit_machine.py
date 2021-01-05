@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
 import configparser
 import requests
@@ -12,6 +12,7 @@ import traceback
 from urllib.parse import urlencode
 
 
+# 주석 추가
 class UpbitMachine:
     BASE_API_URL = "https://api.upbit.com/v1/"
     trading = False  # 현재 거래중인지 나타냄 -> 동시에 여러 거래가 이루어지는 것을 방지
